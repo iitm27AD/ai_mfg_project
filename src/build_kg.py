@@ -9,6 +9,18 @@ Reads credentials from .env  (NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD).
 
 NOTE: GT_IMPACTS relationships are the ANSWER KEY for evaluation / GNN training.
       Agent traversal queries must NEVER traverse GT_IMPACTS edges.
+
+Changes vs. previous version
+----------------------------
+1. Added QualityRequirement node label (+ uniqueness constraint).
+2. Added (Component)-[:MUST_MEET]->(QualityRequirement).
+3. Added (ECO)-[:SIMILAR_TO]->(ECO)  (rule-based; does NOT use GT_IMPACTS).
+4. Added spec-named relationships alongside the existing ones:
+     (Component)-[:PART_OF]->(Assembly)     (Subsystem nodes also get :Assembly label)
+     (Process)-[:REQUIRES]->(Machine)
+     (Component)-[:SUPPLIED_BY]->(Supplier)
+5. BUG FIX: edge properties from graph_edges.csv (cpk, lead_time_days, quantity, ...)
+   are now actually stored on the relationships (previously parsed but never SET).
 """
 
 import argparse
@@ -79,7 +91,8 @@ def parse_json_properties(s: str) -> dict:
     if not isinstance(s, str) or not s.strip():
         return {}
     try:
-        return json.loads(s)
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         result = {}
         for key, val in re.findall(r'([A-Za-z_]+)\\*"?:\s*([\d.]+)', s):
@@ -107,6 +120,15 @@ def safe(val):
     except (TypeError, ValueError):
         pass
     return val
+
+
+def clean_props(props: dict) -> dict:
+    """Keep only scalar (str/int/float/bool) edge properties — Neo4j-safe."""
+    out = {}
+    for k, v in (props or {}).items():
+        if isinstance(v, (str, int, float, bool)):
+            out[str(k)] = v
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -193,7 +215,8 @@ def run_batched(session, query: str, records: list, batch: int = BATCH):
 
 # Fixed vocabulary — no user input, safe from injection
 LABELS = ["Product", "Subsystem", "Component", "Material",
-          "Process", "Machine", "Supplier", "SOP", "ECO"]
+          "Process", "Machine", "Supplier", "SOP", "ECO",
+          "QualityRequirement"]
 
 
 def create_constraints(driver):
@@ -213,11 +236,10 @@ def create_constraints(driver):
 def load_product_subsystem_nodes(session, graph_edges: pd.DataFrame):
     """
     Infer Product and Subsystem nodes from graph_edges.
-    source_node_type == 'Product' → Product node
-    source_node_type == 'Subsystem' → Subsystem node (also target of CONTAINS from Product)
+    source_node_type == 'PRODUCT' → Product node
+    targets of Product-sourced edges → Subsystem nodes
     """
     prod_rows  = graph_edges[graph_edges["source_node_type"] == "PRODUCT"]
-    sub_rows   = graph_edges[graph_edges["source_node_type"] == "SUBSYSTEM"]
 
     products   = prod_rows["source_node_id"].unique()
     subsystems = prod_rows["target_node_id"].unique()  # targets of Product-CONTAINS edges
@@ -534,9 +556,12 @@ def load_contains_rels(session, graph_edges: pd.DataFrame, bom: pd.DataFrame):
 def load_graph_edge_rels(session, graph_edges: pd.DataFrame):
     """
     Load MADE_OF, MANUFACTURED_BY, CAPABLE_OF, GOVERNED_BY, SUPPLIED_BY
-    directly from graph_edges (they override/supplement CSV-derived rels).
+    directly from graph_edges.
+
+    FIX: edge properties parsed from properties_json (e.g. cpk, lead_time_days)
+    are now stored on the relationship via `SET rel += r.props`.
     """
-    # Map relationship_type → (source_label, target_label, Cypher query)
+    # relationship_type → (source_label, target_label)
     rel_map = {
         "MADE_OF":          ("Component", "Material"),
         "MANUFACTURED_BY":  ("Component", "Process"),
@@ -551,22 +576,20 @@ def load_graph_edge_rels(session, graph_edges: pd.DataFrame):
         for _, row in subset.iterrows():
             src = safe(row.get("source_node_id"))
             tgt = safe(row.get("target_node_id"))
-            props = row.get("props", {}) or {}
+            props = clean_props(row.get("props", {}))
             if src and tgt:
-                rec = {"src": src, "tgt": tgt}
-                rec.update(props)   # embed edge properties (e.g. quantity, cpk)
-                records.append(rec)
+                records.append({"src": src, "tgt": tgt, "props": props})
 
         if not records:
             continue
 
-        # Build the SET clause for any props beyond src/tgt
-        # Fixed rel type from a whitelist — not user input
+        # Labels / rel type come from the fixed whitelist above — not user input
         print(f"  Creating {len(records)} {rel_type} ({src_label}→{tgt_label}) …")
         q = f"""
             UNWIND $rows AS r
             MATCH (a:{src_label} {{id: r.src}}), (b:{tgt_label} {{id: r.tgt}})
             MERGE (a)-[rel:{rel_type}]->(b)
+            SET rel += r.props
         """
         run_batched(session, q, records)
 
@@ -710,6 +733,145 @@ def load_gt_impacts(session, labels: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STEP-2 SPEC ADDITIONS
+#   QualityRequirement, MUST_MEET, SIMILAR_TO, PART_OF, REQUIRES, Component-SUPPLIED_BY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_quality_requirements(session, components: pd.DataFrame, sops: pd.DataFrame):
+    """
+    QualityRequirement nodes + (Component)-[:MUST_MEET]->(QualityRequirement).
+
+    There is no quality-requirement CSV, so they are DERIVED from existing data:
+      1. One dimensional-tolerance requirement per component
+         (from components.nominal_tolerance_mm).
+      2. One requirement per SOP (from sops.critical_tolerances), attached to every
+         component governed by that SOP.
+    """
+    # 1. per-component tolerance requirements
+    comp_qr = []
+    for _, row in components.iterrows():
+        cid = safe(row.get("component_id"))
+        if not cid:
+            continue
+        tol = safe(row.get("nominal_tolerance_mm"))
+        comp_qr.append({
+            "id":   f"QR-TOL-{cid}",
+            "cid":  cid,
+            "type": "dimensional_tolerance",
+            "tolerance_mm": float(tol) if tol is not None else None,
+        })
+
+    print(f"  Creating {len(comp_qr)} QualityRequirement (component tolerance) + MUST_MEET …")
+    run_batched(session, """
+        UNWIND $rows AS r
+        MERGE (q:QualityRequirement {id: r.id})
+        SET q.type = r.type,
+            q.tolerance_mm = r.tolerance_mm,
+            q.source = 'components.nominal_tolerance_mm'
+        WITH q, r
+        MATCH (c:Component {id: r.cid})
+        MERGE (c)-[:MUST_MEET]->(q)
+    """, comp_qr)
+
+    # 2. per-SOP critical-tolerance requirements
+    sop_qr = []
+    for _, row in sops.iterrows():
+        sid = safe(row.get("sop_id"))
+        if not sid:
+            continue
+        sop_qr.append({
+            "id":   f"QR-SOP-{sid}",
+            "sid":  sid,
+            "type": "sop_critical_tolerance",
+            "spec": safe(row.get("critical_tolerances")),
+            "risk": safe(row.get("risk_classification")),
+        })
+
+    print(f"  Creating {len(sop_qr)} QualityRequirement (SOP critical tolerance) + MUST_MEET …")
+    run_batched(session, """
+        UNWIND $rows AS r
+        MERGE (q:QualityRequirement {id: r.id})
+        SET q.type = r.type,
+            q.spec = r.spec,
+            q.risk = r.risk,
+            q.source = 'sops.critical_tolerances'
+        WITH q, r
+        MATCH (c:Component)-[:GOVERNED_BY]->(:SOP {id: r.sid})
+        MERGE (c)-[:MUST_MEET]->(q)
+    """, sop_qr)
+
+
+def load_eco_similarity(session):
+    """
+    (ECO)-[:SIMILAR_TO]->(ECO)
+
+    Rule-based, built ONLY from ECO input attributes — never from GT_IMPACTS
+    (that would leak the answer key to the agent).
+
+    Two ECOs are similar if they share the same change_type AND either
+      - target the same component, or
+      - share the same change_family and impact_dimension.
+    Stored once per pair (a.id < b.id) with a `basis` property; the agent can
+    traverse it in either direction with an undirected pattern.
+    """
+    print("  Creating SIMILAR_TO (ECO↔ECO, same target) …")
+    session.run("""
+        MATCH (a:ECO), (b:ECO)
+        WHERE a.id < b.id
+          AND a.change_type = b.change_type
+          AND a.target_node_id = b.target_node_id
+        MERGE (a)-[s:SIMILAR_TO]->(b)
+        SET s.basis = 'same_change_type_and_target', s.score = 1.0
+    """)
+
+    print("  Creating SIMILAR_TO (ECO↔ECO, same family + impact dimension) …")
+    session.run("""
+        MATCH (a:ECO), (b:ECO)
+        WHERE a.id < b.id
+          AND a.change_type = b.change_type
+          AND a.family = b.family
+          AND a.impact_dimension = b.impact_dimension
+          AND NOT (a)-[:SIMILAR_TO]->(b)
+        MERGE (a)-[s:SIMILAR_TO]->(b)
+        SET s.basis = 'same_change_type_family_dimension', s.score = 0.5
+    """)
+
+
+def load_spec_alias_rels(session):
+    """
+    Add the relationship names/directions exactly as written in the Step-2 spec,
+    alongside the existing ones (existing CONTAINS / CAPABLE_OF / Material-SUPPLIED_BY
+    are kept, so nothing already built is broken).
+
+      (Component)-[:PART_OF]->(Assembly)   Subsystem nodes also get the :Assembly label
+      (Process)-[:REQUIRES]->(Machine)     reverse of Machine-CAPABLE_OF->Process
+      (Component)-[:SUPPLIED_BY]->(Supplier)  via Component-MADE_OF->Material-SUPPLIED_BY->Supplier
+    """
+    print("  Adding :Assembly label to Subsystem nodes …")
+    session.run("MATCH (s:Subsystem) SET s:Assembly")
+
+    print("  Creating PART_OF (Component→Assembly) …")
+    session.run("""
+        MATCH (s:Subsystem)-[:CONTAINS]->(c:Component)
+        MERGE (c)-[:PART_OF]->(s)
+    """)
+
+    print("  Creating REQUIRES (Process→Machine) …")
+    session.run("""
+        MATCH (m:Machine)-[r:CAPABLE_OF]->(p:Process)
+        MERGE (p)-[req:REQUIRES]->(m)
+        SET req.cpk = r.cpk
+    """)
+
+    print("  Creating SUPPLIED_BY (Component→Supplier) …")
+    session.run("""
+        MATCH (c:Component)-[:MADE_OF]->(:Material)-[sb:SUPPLIED_BY]->(s:Supplier)
+        MERGE (c)-[cs:SUPPLIED_BY]->(s)
+        SET cs.lead_time_days = sb.lead_time_days
+    """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WIPE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -761,6 +923,11 @@ def main():
         load_component_sop_rels(s, data["components"])
         load_eco_rels(s, data["eco"])
         load_gt_impacts(s, data["labels"])
+
+        print("\n── Step-2 spec additions ───────────────────────────────────")
+        load_quality_requirements(s, data["components"], data["sops"])
+        load_eco_similarity(s)
+        load_spec_alias_rels(s)
 
     driver.close()
     print("\n✅  Knowledge graph build complete.")
